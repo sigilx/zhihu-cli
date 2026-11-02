@@ -1,11 +1,14 @@
 //! 登录态管理：cookie 文件、二维码登录。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use image::{GrayImage, Luma};
 use qrcode::{Color as QrColor, QrCode};
+use reqwest::blocking::Client;
+use reqwest::cookie::Jar;
 use serde_json::{json, Value};
 
 use crate::client::{add_cookies, build_http, jar_cookies, new_jar};
@@ -16,6 +19,11 @@ use crate::config::{
 use crate::display;
 
 pub fn cookie_str_to_dict(cookie_str: &str) -> HashMap<String, String> {
+    let cookie_str = cookie_str.trim();
+    let cookie_str = cookie_str
+        .strip_prefix("Cookie:")
+        .or_else(|| cookie_str.strip_prefix("cookie:"))
+        .unwrap_or(cookie_str);
     let mut map = HashMap::new();
     for item in cookie_str.split(';') {
         let item = item.trim();
@@ -137,70 +145,87 @@ fn fetch_missing_cookies(cookies: &HashMap<String, String>) -> Option<HashMap<St
 
 // ── 二维码登录 ────────────────────────────────────────────────────────────────
 
-pub fn qrcode_login() -> Result<HashMap<String, String>> {
-    let jar = new_jar();
-    let http = build_http(jar.clone())?;
+/// 进行中的二维码登录会话，供 CLI 和 TUI 共用。
+pub struct QrLogin {
+    http: Client,
+    jar: Arc<Jar>,
+    token: String,
+    pub link: String,
+    deadline: Instant,
+}
 
-    // 1. 登录页，拿到 _xsrf 等初始 cookie
-    let _ = http
-        .get(ZHIHU_LOGIN_URL)
-        .header("Referer", format!("{}/", ZHIHU_BASE_URL))
-        .header("Origin", ZHIHU_BASE_URL)
-        .send();
+impl QrLogin {
+    /// 请求二维码，返回一个可轮询的会话。
+    pub fn start() -> Result<Self> {
+        let jar = new_jar();
+        let http = build_http(jar.clone())?;
 
-    // 2. udid（生成 d_c0 / q_c1）
-    let _ = http
-        .post(format!("{}/udid", ZHIHU_BASE_URL))
-        .json(&json!({}))
-        .send();
+        // 1. 登录页，拿到 _xsrf 等初始 cookie
+        let _ = http
+            .get(ZHIHU_LOGIN_URL)
+            .header("Referer", format!("{}/", ZHIHU_BASE_URL))
+            .header("Origin", ZHIHU_BASE_URL)
+            .send();
 
-    // 3. capsion_ticket（扫码确认流程需要）
-    let _ = http.get(ZHIHU_OAUTH_CAPTCHA).send();
+        // 2. udid（生成 d_c0 / q_c1）
+        let _ = http
+            .post(format!("{}/udid", ZHIHU_BASE_URL))
+            .json(&json!({}))
+            .send();
 
-    // 4. 获取二维码 token 与链接
-    let xsrf = jar_cookies(&jar).get("_xsrf").cloned();
-    let mut req = http
-        .post(ZHIHU_QRCODE_API)
-        .header("Referer", format!("{}/signin", ZHIHU_BASE_URL))
-        .header("Origin", ZHIHU_BASE_URL)
-        .header("x-requested-with", "fetch")
-        .json(&json!({}));
-    if let Some(x) = &xsrf {
-        req = req.header("x-xsrftoken", x);
-    }
-    let resp = req.send().context("获取二维码失败")?;
-    if !resp.status().is_success() {
-        bail!("获取二维码失败: HTTP {}", resp.status());
-    }
-    let data: Value = resp.json().context("二维码接口返回无效 JSON")?;
-    let token = data
-        .get("token")
-        .or_else(|| data.get("qrcode_token"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let link = data.get("link").and_then(Value::as_str).unwrap_or("");
-    if token.is_empty() || link.is_empty() {
-        bail!("二维码接口未返回 token 或 link");
-    }
+        // 3. capsion_ticket（扫码确认流程需要）
+        let _ = http.get(ZHIHU_OAUTH_CAPTCHA).send();
 
-    // 5. 保存 PNG，并在终端显示
-    if let Err(e) = save_qrcode_png(link) {
-        display::hint(&format!("二维码图片保存失败: {e}"));
-    }
-    display::info("请使用知乎 App 扫描下方二维码登录");
-    println!("\n{}", render_qr_terminal(link)?);
-    display::hint(&format!("若终端无法显示二维码，请用手机浏览器打开: {link}"));
-    println!();
-    display::info("请在手机上点击「确认登录」…");
-
-    // 6. 轮询扫码状态
-    let scan_url = format!("{}/{}/scan_info", ZHIHU_QRCODE_API, token);
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut success = false;
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(150));
+        // 4. 获取二维码 token 与链接
         let xsrf = jar_cookies(&jar).get("_xsrf").cloned();
         let mut req = http
+            .post(ZHIHU_QRCODE_API)
+            .header("Referer", format!("{}/signin", ZHIHU_BASE_URL))
+            .header("Origin", ZHIHU_BASE_URL)
+            .header("x-requested-with", "fetch")
+            .json(&json!({}));
+        if let Some(x) = &xsrf {
+            req = req.header("x-xsrftoken", x);
+        }
+        let resp = req.send().context("获取二维码失败")?;
+        if !resp.status().is_success() {
+            bail!("获取二维码失败: HTTP {}", resp.status());
+        }
+        let data: Value = resp.json().context("二维码接口返回无效 JSON")?;
+        let token = data
+            .get("token")
+            .or_else(|| data.get("qrcode_token"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let link = data
+            .get("link")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if token.is_empty() || link.is_empty() {
+            bail!("二维码接口未返回 token 或 link");
+        }
+
+        Ok(Self {
+            http,
+            jar,
+            token,
+            link,
+            deadline: Instant::now() + Duration::from_secs(120),
+        })
+    }
+
+    pub fn is_expired(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
+    /// 轮询一次扫码状态；确认成功后返回当前 cookie。
+    pub fn poll(&mut self) -> Result<Option<HashMap<String, String>>> {
+        let scan_url = format!("{}/{}/scan_info", ZHIHU_QRCODE_API, self.token);
+        let xsrf = jar_cookies(&self.jar).get("_xsrf").cloned();
+        let mut req = self
+            .http
             .get(&scan_url)
             .header("Referer", format!("{}/signin?next=%2F", ZHIHU_BASE_URL))
             .header("Accept", "*/*")
@@ -214,20 +239,19 @@ pub fn qrcode_login() -> Result<HashMap<String, String>> {
         }
         let resp = match req.send() {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(_) => return Ok(None),
         };
-        let now_cookies = jar_cookies(&jar);
+        let now_cookies = jar_cookies(&self.jar);
         if now_cookies.contains_key("z_c0") {
-            success = true;
-            break;
+            return Ok(Some(now_cookies));
         }
         if !resp.status().is_success() {
-            continue;
+            return Ok(None);
         }
         let info: Value = resp.json().unwrap_or_else(|_| json!({}));
         let api_status = info.get("status").and_then(Value::as_i64);
         if api_status == Some(0) || api_status == Some(1) {
-            continue;
+            return Ok(None);
         }
         if info
             .get("access_token")
@@ -235,8 +259,7 @@ pub fn qrcode_login() -> Result<HashMap<String, String>> {
             .unwrap_or(false)
             || info.get("user_id").map(|v| !v.is_null()).unwrap_or(false)
         {
-            success = true;
-            break;
+            return Ok(Some(jar_cookies(&self.jar)));
         }
         let login_status = info
             .get("login_status")
@@ -247,14 +270,12 @@ pub fn qrcode_login() -> Result<HashMap<String, String>> {
             login_status.as_str(),
             "CONFIRMED" | "LOGIN_SUCCESS" | "SUCCESS" | "OK" | "LOGGED_IN"
         ) {
-            success = true;
-            break;
+            return Ok(Some(jar_cookies(&self.jar)));
         }
         if info.get("success").and_then(Value::as_bool) == Some(true)
             || info.get("logged_in").and_then(Value::as_bool) == Some(true)
         {
-            success = true;
-            break;
+            return Ok(Some(jar_cookies(&self.jar)));
         }
         // 接口有时把 cookie 直接放在 body 里
         if let Some(cookie_str) = info
@@ -263,29 +284,60 @@ pub fn qrcode_login() -> Result<HashMap<String, String>> {
             .and_then(Value::as_str)
         {
             if cookie_str.contains("z_c0") {
-                add_cookies(&jar, &cookie_str_to_dict(cookie_str));
+                add_cookies(&self.jar, &cookie_str_to_dict(cookie_str));
             }
         }
         if let Some(z) = info.get("z_c0").and_then(Value::as_str) {
             let mut m = HashMap::new();
             m.insert("z_c0".to_string(), z.to_string());
-            add_cookies(&jar, &m);
+            add_cookies(&self.jar, &m);
         }
-        if jar_cookies(&jar).contains_key("z_c0") {
-            success = true;
-            break;
+        let cookies = jar_cookies(&self.jar);
+        if cookies.contains_key("z_c0") {
+            return Ok(Some(cookies));
+        }
+        Ok(None)
+    }
+
+    /// 结束轮询时再请求一次登录接口，尽量拿到完整 cookie。
+    pub fn finish(&mut self) -> Result<HashMap<String, String>> {
+        let _ = self
+            .http
+            .get(format!("{}/api/v4/me", ZHIHU_BASE_URL))
+            .send();
+        let cookies = jar_cookies(&self.jar);
+        if !has_required_cookies(&cookies) {
+            bail!("二维码登录超时或未完成确认（未获取到 z_c0）");
+        }
+        Ok(cookies)
+    }
+}
+
+pub fn qrcode_login() -> Result<HashMap<String, String>> {
+    let mut login = QrLogin::start()?;
+
+    // 保存 PNG，并在终端显示
+    if let Err(e) = save_qrcode_png(&login.link) {
+        display::hint(&format!("二维码图片保存失败: {e}"));
+    }
+    display::info("请使用知乎 App 扫描下方二维码登录");
+    println!("\n{}", render_qr_terminal(&login.link)?);
+    display::hint(&format!(
+        "若终端无法显示二维码，请用手机浏览器打开: {}",
+        login.link
+    ));
+    println!();
+    display::info("请在手机上点击「确认登录」…");
+
+    while !login.is_expired() {
+        std::thread::sleep(Duration::from_millis(150));
+        if let Some(cookies) = login.poll()? {
+            save_cookies(&cookies)?;
+            return Ok(cookies);
         }
     }
 
-    if !success {
-        // 再请求一次需要登录的接口，触发完整 cookie
-        let _ = http.get(format!("{}/api/v4/me", ZHIHU_BASE_URL)).send();
-    }
-
-    let cookies = jar_cookies(&jar);
-    if !has_required_cookies(&cookies) {
-        bail!("二维码登录超时或未完成确认（未获取到 z_c0）");
-    }
+    let cookies = login.finish()?;
     save_cookies(&cookies)?;
     Ok(cookies)
 }
@@ -320,7 +372,8 @@ fn save_qrcode_png(link: &str) -> Result<()> {
     Ok(())
 }
 
-fn render_qr_terminal(link: &str) -> Result<String> {
+/// 把二维码渲染成可放入终端界面的行（不含左侧缩进）。
+pub fn qr_lines(link: &str) -> Result<Vec<String>> {
     let code = QrCode::new(link.as_bytes()).context("生成二维码失败")?;
     let width = code.width();
     let colors = code.to_colors();
@@ -333,19 +386,29 @@ fn render_qr_terminal(link: &str) -> Result<String> {
             colors[(y - border) * width + (x - border)] == QrColor::Dark
         }
     };
-    let mut out = String::new();
+    let mut lines = Vec::new();
     for y in (0..padded).step_by(2) {
-        out.push_str("  ");
+        let mut line = String::new();
         for x in 0..padded {
             let top = is_dark(x, y);
             let bottom = is_dark(x, y + 1);
-            out.push(match (top, bottom) {
+            line.push(match (top, bottom) {
                 (false, false) => ' ',
                 (true, false) => '▀',
                 (false, true) => '▄',
                 (true, true) => '█',
             });
         }
+        lines.push(line);
+    }
+    Ok(lines)
+}
+
+fn render_qr_terminal(link: &str) -> Result<String> {
+    let mut out = String::new();
+    for line in qr_lines(link)? {
+        out.push_str("  ");
+        out.push_str(&line);
         out.push('\n');
     }
     Ok(out)

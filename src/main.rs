@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod display;
 mod html;
+mod tui;
 mod util;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +19,7 @@ static VERBOSE: AtomicBool = AtomicBool::new(false);
     name = "zhihu",
     version,
     about = "知乎命令行工具 — 在终端搜索、阅读、互动",
-    long_about = "zhihu-cli 的 Rust 实现：搜索、热榜、问题/回答/评论、推荐、用户资料、\n发布提问/想法/文章、收藏与通知。正文 HTML 会按终端宽度重新排版。"
+    long_about = "zhihu-cli 的 Rust 实现：搜索、热榜、问题/回答/评论、推荐、用户资料、\n发布提问/想法/文章、收藏与通知。正文 HTML 会按终端宽度重新排版。\n\n不带子命令运行 `zhihu` 可进入交互式两栏阅读器：\n左侧浏览热榜/推荐/搜索，右侧阅读正文，支持后台加载与滚动。"
 )]
 struct Cli {
     /// 显示详细错误信息
@@ -26,7 +27,7 @@ struct Cli {
     verbose: bool,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -324,7 +325,10 @@ enum Command {
 
 fn run(cli: Cli) -> Result<()> {
     VERBOSE.store(cli.verbose, Ordering::Relaxed);
-    match cli.command {
+    let Some(command) = cli.command else {
+        return tui::run();
+    };
+    match command {
         Command::Login { qrcode, cookie } => commands::auth::login(qrcode, cookie),
         Command::Logout => commands::auth::logout(),
         Command::Status => commands::auth::status(),
