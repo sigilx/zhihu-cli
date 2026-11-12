@@ -677,7 +677,7 @@ fn style_for(kind: LineKind) -> Style {
         LineKind::Heading => Style::default()
             .fg(Color::LightGreen)
             .add_modifier(Modifier::BOLD),
-        LineKind::Meta => Style::default().fg(DIM),
+        LineKind::Meta => Style::default().fg(Color::Gray),
         LineKind::Body => Style::default(),
         LineKind::Comment => Style::default().fg(Color::Gray),
         LineKind::Blank => Style::default(),
@@ -726,6 +726,8 @@ fn push_html(out: &mut Vec<StyledLine>, html: &str, width: usize, indent: usize)
     let rendered = render_html(html, width.saturating_sub(indent).max(20));
     for line in rendered.lines() {
         if line.is_empty() {
+            // render_html 用单个空行标记块边界，TUI 里放大成两行，段落更好认。
+            push_blank(out);
             push_blank(out);
         } else {
             out.push(StyledLine {
@@ -800,6 +802,13 @@ fn build_detail_lines(detail: &Detail, width: usize) -> Vec<StyledLine> {
             push_blank(&mut out);
 
             for (index, answer) in answers.iter().enumerate() {
+                if index > 0 {
+                    out.push(StyledLine {
+                        text: format!("  {}", "─".repeat(width.saturating_sub(2).max(8))),
+                        kind: LineKind::Meta,
+                    });
+                    push_blank(&mut out);
+                }
                 let author = {
                     let name = ptr_str(answer, "/author/name");
                     if name.is_empty() {
